@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type DragEvent, type PointerEvent as ReactPointerEvent } from 'react'
 import { AnimePanel, type DetectState } from './components/AnimePanel'
 import { GestureGuide } from './components/GestureGuide'
+import { ImagePreview } from './components/ImagePreview'
 import { CameraIcon, CloseIcon, GridIcon, HandIcon, HelpIcon, HideIcon, PresentIcon, ShowIcon, StopIcon, UploadIcon } from './components/Icons'
 import { beginFrame, drawOverlay } from './lib/draw'
 import { drawReveal, featherPortrait } from './lib/drawReveal'
@@ -8,11 +9,12 @@ import { detectPortraitAnchors, loadFaceLandmarker } from './lib/faceTracker'
 import { angle, dist, itemSize, topItemAt } from './lib/geometry'
 import { GestureEngine } from './lib/gestureEngine'
 import { HAND_CONNECTIONS, loadHandLandmarker, startCamera, stopCamera, toHandFrames, TrackerError, unsupportedReason } from './lib/handTracker'
-import { baseWidthFor, gridLayout, newId } from './lib/layout'
+import { baseWidthFor, galleryRegion, gridLayout, newId } from './lib/layout'
+import { previewLayout, previewTitle } from './lib/preview'
 import { DEFAULT_CALIBRATION, faceFrameFromLandmarks, faceMatrix, RevealTracker, type Anchors, type Calibration, type FaceFrame } from './lib/reveal'
 import { DEFAULT_ANCHORS, SAMPLE_PORTRAIT } from './lib/samplePortrait'
 import { SAMPLES } from './lib/samples'
-import type { HandFrame, HandStatus, Item, Vec2 } from './lib/types'
+import type { HandFrame, HandStatus, Item, Rect, Tap, Vec2 } from './lib/types'
 
 type CameraState = 'idle' | 'starting' | 'running'
 type Mode = 'playground' | 'anime'
@@ -65,8 +67,25 @@ function createSamples(): Item[] {
     rotation: 0,
     z: i + 1,
   }))
-  return gridLayout(samples, stage)
+  return gridLayout(samples, stage, galleryRegion(stage))
 }
+
+/** Element's box in stage coordinates (the stage fills the window). */
+const stageRect = (el: Element | null, grow = 0): Rect | null => {
+  if (!el) return null
+  const r = el.getBoundingClientRect()
+  return { x: r.left - grow, y: r.top - grow, w: r.width + 2 * grow, h: r.height + 2 * grow }
+}
+const inRect = (r: Rect | null, p: Vec2) => !!r && p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h
+
+interface PreviewState {
+  id: string
+  closing: boolean
+  /** Opened from the keyboard — move focus into the card and back to the image on close. */
+  viaKeyboard: boolean
+}
+/** Matches the fade-out in `.preview.closing`. */
+const PREVIEW_EXIT_MS = 120
 
 interface Summary {
   hands: number
@@ -84,7 +103,7 @@ interface RevealSummary {
 const EMPTY_REVEAL: RevealSummary = { face: false, window: false }
 
 const toStatuses = (frames: HandFrame[]): HandStatus[] =>
-  frames.map((f) => ({ key: f.key, phase: 'open', pinch: f.pinch, pinched: false, itemId: null, lost: false }))
+  frames.map((f) => ({ key: f.key, phase: 'open', pinch: f.pinch, pinched: false, itemId: null, lost: false, tip: f.pinch, hoverId: null }))
 
 export default function App() {
   const stageRef = useRef<HTMLDivElement>(null)
@@ -109,6 +128,11 @@ export default function App() {
   const [presenting, setPresenting] = useState(false)
   const [guideOpen, setGuideOpen] = useState(() => !readFlag(GUIDE_KEY))
   const [dragOver, setDragOver] = useState(false)
+  const [viewport, setViewport] = useState({ w: window.innerWidth, h: window.innerHeight })
+  const [preview, setPreview] = useState<PreviewState | null>(null)
+  const previewIdRef = useRef<string | null>(null)
+  const previewCardRef = useRef<HTMLDivElement>(null)
+  const previewCloseRef = useRef<HTMLButtonElement>(null)
 
   // Anime Reveal
   const [mode, setMode] = useState<Mode>('playground')
@@ -197,6 +221,7 @@ export default function App() {
     if (!el) return
     const ro = new ResizeObserver(([entry]) => {
       stageSize.current = { w: entry.contentRect.width, h: entry.contentRect.height }
+      setViewport(stageSize.current)
     })
     ro.observe(el)
     return () => ro.disconnect()
@@ -218,6 +243,57 @@ export default function App() {
     return () => clearTimeout(t)
   }, [notice])
 
+  // ---------- preview ----------
+
+  const openPreview = useCallback((id: string, viaKeyboard = false) => {
+    previewIdRef.current = id
+    setPreview({ id, closing: false, viaKeyboard })
+  }, [])
+
+  const closePreview = useCallback(() => {
+    if (!previewIdRef.current) return
+    previewIdRef.current = null
+    setPreview((p) => (p && !p.closing ? { ...p, closing: true } : p))
+  }, [])
+
+  /** Tap or click on an image: open its preview, or close it if it's the one already open. */
+  const togglePreview = useCallback(
+    (id: string, viaKeyboard = false) => (previewIdRef.current === id ? closePreview() : openPreview(id, viaKeyboard)),
+    [openPreview, closePreview],
+  )
+
+  // Finish the fade-out, then unmount (and hand focus back if the keyboard opened it).
+  useEffect(() => {
+    if (!preview?.closing) return
+    const t = setTimeout(() => {
+      setPreview((p) => (p?.closing ? null : p))
+      if (preview.viaKeyboard) stageRef.current?.querySelector<HTMLElement>(`[data-id="${preview.id}"]`)?.focus()
+    }, PREVIEW_EXIT_MS)
+    return () => clearTimeout(t)
+  }, [preview])
+
+  useEffect(() => {
+    if (preview?.viaKeyboard && !preview.closing) previewCloseRef.current?.focus()
+  }, [preview?.id, preview?.viaKeyboard, preview?.closing])
+
+  // The previewed image was removed.
+  useEffect(() => {
+    if (preview && !items.some((it) => it.id === preview.id)) closePreview()
+  }, [items, preview, closePreview])
+
+  /** Gesture taps: the close button wins, then the card itself (ignored), then images; empty space closes. */
+  const handleTaps = useCallback(
+    (taps: Tap[]) => {
+      for (const tap of taps) {
+        if (previewIdRef.current && inRect(stageRect(previewCloseRef.current, 10), tap.point)) closePreview()
+        else if (previewIdRef.current && inRect(stageRect(previewCardRef.current), tap.point)) continue
+        else if (tap.itemId) togglePreview(tap.itemId)
+        else closePreview()
+      }
+    },
+    [closePreview, togglePreview],
+  )
+
   // ---------- gesture pipeline ----------
 
   const lastSelFromEngine = useRef<string | null>(null)
@@ -234,7 +310,7 @@ export default function App() {
           : null
     const hoverIds = hands
       .filter((h) => h.phase === 'open' && !h.lost)
-      .map((h) => topItemAt(itemsRef.current, h.pinch, 40)?.id)
+      .map((h) => h.hoverId)
       .filter((id): id is string => !!id)
     const heldIds = [...new Set(hands.map((h) => h.itemId).filter((id): id is string => !!id))]
     const next: Summary = { hands: hands.filter((h) => !h.lost).length, action, lost: hands.some((h) => h.lost), hoverIds, heldIds }
@@ -273,8 +349,16 @@ export default function App() {
         return
       }
       const engine = engineRef.current
-      const res = engine.step(frames, now, itemsRef.current)
+      // An open preview covers whatever is underneath it.
+      const card = previewIdRef.current ? stageRect(previewCardRef.current) : null
+      const res = engine.step(frames, now, itemsRef.current, { blockers: card ? [card] : [] })
       if (res.changed) commit(() => res.items)
+      if (res.taps.length) handleTaps(res.taps)
+      const closeBtn = previewCloseRef.current
+      if (closeBtn) {
+        const r = stageRect(closeBtn, 10)
+        closeBtn.classList.toggle('tip-hover', res.hands.some((h) => !h.pinched && !h.lost && inRect(r, h.tip)))
+      }
       if (res.selectedId && res.selectedId !== lastSelFromEngine.current) {
         lastSelFromEngine.current = res.selectedId
         setSelectedId(res.selectedId)
@@ -283,7 +367,7 @@ export default function App() {
       if (ctx) drawOverlay(ctx, stageSize.current, frames, res.hands, HAND_CONNECTIONS, showLandmarksRef.current)
       publishSummary(res.hands)
     },
-    [commit, publishSummary, publishReveal],
+    [commit, publishSummary, publishReveal, handleTaps],
   )
 
   const stopAll = useCallback(() => {
@@ -439,7 +523,7 @@ export default function App() {
     [commit],
   )
 
-  const resetLayout = () => commit((prev) => gridLayout(prev, stageSize.current))
+  const resetLayout = () => commit((prev) => gridLayout(prev, stageSize.current, galleryRegion(stageSize.current)))
 
   // ---------- anime reveal ----------
 
@@ -452,6 +536,8 @@ export default function App() {
       modeRef.current = next
       setMode(next)
       setSelectedId(null)
+      previewIdRef.current = null
+      setPreview(null)
       lastSummaryKey.current = ''
       lastRevealKey.current = ''
       setSummary(EMPTY_SUMMARY)
@@ -506,7 +592,7 @@ export default function App() {
   // ---------- mouse fallback ----------
 
   const pointer = useRef<
-    | { mode: 'drag'; id: string; offset: Vec2; pid: number }
+    | { mode: 'drag'; id: string; offset: Vec2; pid: number; down: Vec2; at: number; moved: number }
     | { mode: 'handle'; id: string; v0: Vec2; s0: number; r0: number; pid: number }
     | null
   >(null)
@@ -531,7 +617,7 @@ export default function App() {
     if (!it) return
     const p = toStage(e)
     ;(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId)
-    pointer.current = { mode: 'drag', id, offset: { x: it.x - p.x, y: it.y - p.y }, pid: e.pointerId }
+    pointer.current = { mode: 'drag', id, offset: { x: it.x - p.x, y: it.y - p.y }, pid: e.pointerId, down: p, at: e.timeStamp, moved: 0 }
     setSelectedId(id)
     bringToFront(id)
   }
@@ -550,6 +636,7 @@ export default function App() {
     const ptr = pointer.current
     if (!ptr || ptr.pid !== e.pointerId) return
     const p = toStage(e)
+    if (ptr.mode === 'drag') ptr.moved = Math.max(ptr.moved, dist(p, ptr.down))
     commit((prev) =>
       prev.map((it) => {
         if (it.id !== ptr.id) return it
@@ -564,7 +651,18 @@ export default function App() {
   }
 
   const onPointerUp = (e: ReactPointerEvent) => {
-    if (pointer.current?.pid === e.pointerId) pointer.current = null
+    const ptr = pointer.current
+    if (ptr?.pid !== e.pointerId) return
+    pointer.current = null
+    // A click (short, barely moved) previews; anything more was a drag.
+    if (e.type === 'pointerup' && ptr.mode === 'drag' && ptr.moved < 6 && e.timeStamp - ptr.at < 500) togglePreview(ptr.id)
+  }
+
+  const onItemKeyDown = (e: React.KeyboardEvent, id: string) => {
+    if (e.key !== 'Enter' && e.key !== ' ') return
+    e.preventDefault()
+    setSelectedId(id)
+    togglePreview(id, true)
   }
 
   // Wheel: resize; Shift+wheel: rotate. Non-passive so we can stop page zoom/scroll.
@@ -631,7 +729,8 @@ export default function App() {
     const onKey = (e: KeyboardEvent) => {
       if (e.target instanceof HTMLInputElement || e.metaKey || e.ctrlKey || e.altKey) return
       const k = e.key.toLowerCase()
-      if (k === 'escape' && presenting) exitPresentation()
+      if (k === 'escape' && previewIdRef.current) closePreview()
+      else if (k === 'escape' && presenting) exitPresentation()
       else if (k === 'p') (presenting ? exitPresentation : enterPresentation)()
       else if (k === 'h' && !presenting) setControlsHidden((v) => !v)
       else if (k === 'l') setShowLandmarks((v) => !v)
@@ -643,7 +742,7 @@ export default function App() {
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [presenting, selectedId, removeItem, exitPresentation, switchMode])
+  }, [presenting, selectedId, removeItem, exitPresentation, switchMode, closePreview])
 
   // Dev-only hook: drive the real gesture pipeline with synthetic hands (used for automated browser checks).
   useEffect(() => {
@@ -698,6 +797,8 @@ export default function App() {
     return chips
   }, [camera, model, summary, mode, faceModel, revealSummary])
 
+  const previewIndex = preview && mode === 'playground' ? items.findIndex((it) => it.id === preview.id) : -1
+  const previewItem = previewIndex >= 0 ? { item: items[previewIndex], index: previewIndex } : null
   const hover = new Set(summary.hoverIds)
   const held = new Set(summary.heldIds)
 
@@ -706,7 +807,10 @@ export default function App() {
       <div
         ref={stageRef}
         className={`stage${camera === 'running' ? ' live' : ''}${dragOver ? ' drag-over' : ''}`}
-        onPointerDown={() => setSelectedId(null)}
+        onPointerDown={() => {
+          setSelectedId(null)
+          closePreview()
+        }}
         onPointerMove={onPointerMove}
         onPointerUp={onPointerUp}
         onPointerCancel={onPointerUp}
@@ -729,14 +833,25 @@ export default function App() {
           </div>
         )}
 
+        {mode === 'playground' && (
+          <div className="intro">
+            <p className="intro-title">
+              A little wave.
+              <br />
+              <span>A closer look.</span>
+            </p>
+            <p className="intro-body">Point at an image, then pinch and release to take a peek.</p>
+          </div>
+        )}
+
         <div className="items" hidden={mode !== 'playground'}>
-          {items.map((it) => {
+          {items.map((it, i) => {
             const { w, h } = itemSize(it)
             const selected = it.id === selectedId && !presenting
             return (
               <div
                 key={it.id}
-                className={`item${selected ? ' selected' : ''}${hover.has(it.id) ? ' hover' : ''}${held.has(it.id) ? ' held' : ''}`}
+                className={`item${selected ? ' selected' : ''}${hover.has(it.id) ? ' hover' : ''}${held.has(it.id) ? ' held' : ''}${preview?.id === it.id && !preview.closing ? ' previewing' : ''}`}
                 style={{
                   width: w,
                   height: h,
@@ -744,6 +859,12 @@ export default function App() {
                   transform: `translate(${it.x - w / 2}px, ${it.y - h / 2}px) rotate(${it.rotation}rad)`,
                 }}
                 onPointerDown={(e) => onItemPointerDown(e, it.id)}
+                onKeyDown={(e) => onItemKeyDown(e, it.id)}
+                tabIndex={mode === 'playground' ? 0 : -1}
+                role="button"
+                aria-label={`Preview ${previewTitle(it, i)}`}
+                aria-haspopup="dialog"
+                aria-expanded={preview?.id === it.id && !preview.closing}
                 data-id={it.id}
               >
                 <img src={it.src} alt={it.name} draggable={false} />
@@ -771,6 +892,19 @@ export default function App() {
 
         <canvas ref={canvasRef} className="overlay" aria-hidden="true" />
       </div>
+
+      {previewItem && (
+        <ImagePreview
+          key={previewItem.item.id}
+          src={previewItem.item.src}
+          title={previewTitle(previewItem.item, previewItem.index)}
+          layout={previewLayout(previewItem.item, viewport, presenting || controlsHidden ? 12 : 80)}
+          closing={!!preview?.closing}
+          onClose={closePreview}
+          cardRef={previewCardRef}
+          closeRef={previewCloseRef}
+        />
+      )}
 
       {!presenting && (
         <>

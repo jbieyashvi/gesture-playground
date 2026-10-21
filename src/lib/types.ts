@@ -43,4 +43,22 @@ export interface HandStatus {
   itemId: string | null
   /** True while the hand is missing but still inside the grace period. */
   lost: boolean
+  /** Smoothed index fingertip — what the hand is pointing at. */
+  tip: Vec2
+  /** Item under the fingertip while the hand is open. */
+  hoverId: string | null
+}
+
+/** A short pinch-and-release with little movement — the gesture equivalent of a click. */
+export interface Tap {
+  /** Where the fingertip was aiming just before the pinch. */
+  point: Vec2
+  itemId: string | null
+}
+
+export interface Rect {
+  x: number
+  y: number
+  w: number
+  h: number
 }

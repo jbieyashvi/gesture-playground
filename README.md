@@ -28,6 +28,8 @@ Other scripts: `npm test` (gesture-engine unit tests), `npm run lint`.
 
 | Gesture | What it does |
 | --- | --- |
+| **Point** at an image with your index fingertip | Highlights it |
+| **Pinch and release quickly** (under 0.5 s, barely moving) while pointing | Opens a small preview beside it; do it on the preview's × to close |
 | **Pinch** thumb + index finger on or near an image | Grabs it and brings it to the front |
 | Keep pinching and **move your hand** | Drags the image |
 | **Open your fingers** | Drops the image where it is |
@@ -39,7 +41,10 @@ Tips:
 - A pinch that starts on empty space grabs nothing, even if you then move over an image.
 - If your hand leaves the frame, the image holds still for 0.3 s, then drops where it is.
   When your hand comes back, open it and pinch again to pick the image up.
-- The ring cursor shows your pinch point: hollow while open, filled while pinching, blue while holding.
+- The ring cursor follows your index fingertip while your hand is open (that's what you aim with), then
+  jumps to your pinch point: filled while pinching, blue while holding.
+- A tap is a pinch that's short *and* still. Anything longer or that travels more than ~28 px is a drag
+  and never opens a preview. Taps have a 0.45 s cooldown, so one pinch opens one preview.
 
 ## Anime Reveal
 
@@ -66,11 +71,14 @@ Calibrating your own portrait:
 
 ## Mouse and keyboard
 
+- **Click** an image to preview it; click it again, click empty space, press **Esc**, or use the × to close.
+  Only one preview is open at a time and the gallery stays usable around it.
+- **Tab** to an image and press **Enter** or **Space** to preview it (focus moves to the ×, and back on close).
 - **Drag** an image to move it.
 - **Scroll** over an image to resize it. Use **Shift + scroll** or the **corner handle** to rotate it
   (hold Shift on the handle to resize without rotating).
 - Drop image files onto the page to add them. **Delete** removes the selected image.
-- **P** turns presentation mode on and off (fullscreen, no UI, cursor hides when idle). **Esc** exits it.
+- **P** turns presentation mode on and off (fullscreen, no UI, cursor hides when idle). **Esc** exits it (after closing any open preview).
 - **M** switches between Playground and Anime Reveal.
 - **H** hides or shows the controls. **L** hides or shows the hand landmarks.
 
@@ -92,4 +100,9 @@ Calibrating your own portrait:
     doesn't drop what you hold.
   - **Tracking loss**: a lost hand freezes for 300 ms, then releases safely. A hand that comes back
     already pinched can't grab until it opens.
-- `src/lib/gestureEngine.test.ts` has 14 tests that cover these behaviours.
+  - **Tap to preview**: a release counts as a tap only if the pinch was short (≤ 500 ms), still (≤ 28 px of
+    travel while closed), one-handed and not lost; the image snaps back to where it was before the press, so
+    dragging stays instant. The open preview is passed in as a blocker so you can't grab or hover through it.
+- `src/lib/preview.ts` places the preview card (right, left, below or above the image, whichever fits) and keeps
+  it inside the viewport, clear of the toolbar.
+- `src/lib/gestureEngine.test.ts` and `src/lib/preview.test.ts` cover these behaviours.

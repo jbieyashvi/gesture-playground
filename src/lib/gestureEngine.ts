@@ -1,6 +1,6 @@
 import { angle, angleDelta, dist, mid, rotate, topItemAt } from './geometry'
 import { OneEuro2D } from './oneEuro'
-import type { HandFrame, HandPhase, HandStatus, Item, Vec2 } from './types'
+import type { HandFrame, HandPhase, HandStatus, Item, Rect, Tap, Vec2 } from './types'
 
 export const GESTURE_CONFIG = {
   /** Pinch ratio below which a pinch starts (thumb–index distance / palm size). */
@@ -18,7 +18,15 @@ export const GESTURE_CONFIG = {
   matchPx: 260,
   minScale: 0.12,
   maxScale: 8,
+  /** A pinch released within this long… */
+  tapMaxMs: 500,
+  /** …that stayed within this many px of where it started is a tap, not a drag. */
+  tapMaxMove: 28,
+  /** Minimum gap between taps, so one gesture never fires twice. */
+  tapCooldownMs: 450,
 }
+
+const INDEX_TIP = 8
 
 type Config = typeof GESTURE_CONFIG
 
@@ -40,6 +48,18 @@ interface Track {
   armed: boolean
   /** item centre − pinch point, captured when a one-hand drag starts. */
   offset: Vec2
+  tipFilter: OneEuro2D
+  tip: Vec2
+  /** Fingertip position frozen when the fingers start closing — where a tap is aimed. */
+  aim: Vec2
+  pressAt: number
+  pressPos: Vec2
+  /** Furthest the pinch point moved from `pressPos` while firmly closed. */
+  travel: number
+  /** Part of a two-hand resize at some point during this pinch — never a tap. */
+  gripped: boolean
+  /** Item position when the pinch grabbed it, restored if the pinch turns out to be a tap. */
+  start: Vec2 | null
 }
 
 interface TwoHandGrip {
@@ -59,12 +79,21 @@ export interface StepResult {
   changed: boolean
   hands: HandStatus[]
   selectedId: string | null
+  taps: Tap[]
 }
+
+export interface StepOptions {
+  /** Areas covered by UI (e.g. an open preview): pinches there grab nothing and fingertips there hover nothing. */
+  blockers?: Rect[]
+}
+
+const inRect = (r: Rect, p: Vec2) => p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h
 
 export class GestureEngine {
   private tracks = new Map<string, Track>()
   private grips = new Map<string, TwoHandGrip>()
   private nextId = 1
+  private lastTapAt = -Infinity
   private cfg: Config
   selectedId: string | null = null
 
@@ -78,8 +107,9 @@ export class GestureEngine {
     this.grips.clear()
   }
 
-  step(frames: HandFrame[], now: number, items: Item[]): StepResult {
+  step(frames: HandFrame[], now: number, items: Item[], opts: StepOptions = {}): StepResult {
     const cfg = this.cfg
+    const blocked = (p: Vec2) => !!opts.blockers?.some((r) => inRect(r, p))
     const byId = new Map(items.map((it) => [it.id, it]))
     const touched = new Set<string>()
     const update = (id: string, patch: Partial<Item>) => {
@@ -104,7 +134,8 @@ export class GestureEngine {
     }
 
     const presses: Track[] = []
-    const releases: Track[] = []
+    const releases: { t: Track; lost: boolean }[] = []
+    const taps: Tap[] = []
 
     frames.forEach((f, i) => {
       let t = assigned.get(i)
@@ -124,6 +155,14 @@ export class GestureEngine {
           empty: false,
           armed: false,
           offset: { x: 0, y: 0 },
+          tipFilter: new OneEuro2D(1.0, 0.015),
+          tip: f.pinch,
+          aim: f.pinch,
+          pressAt: now,
+          pressPos: f.pinch,
+          travel: 0,
+          gripped: false,
+          start: null,
         }
         this.tracks.set(t.id, t)
       }
@@ -131,6 +170,10 @@ export class GestureEngine {
       t.pinch = t.filter.filter(f.pinch, now)
       t.ratio = t.ratio * 0.4 + f.pinchRatio * 0.6
       t.lastSeen = now
+      t.tip = t.tipFilter.filter(f.points[INDEX_TIP] ?? f.pinch, now)
+      if (!t.pinched && t.ratio > cfg.releaseRatio) t.aim = t.tip
+      // Only count movement while firmly closed: opening the fingers shifts the midpoint on its own.
+      if (t.pinched && t.ratio < (cfg.grabRatio + cfg.releaseRatio) / 2) t.travel = Math.max(t.travel, dist(t.pinch, t.pressPos))
 
       // 2. Pinch state with hysteresis + debounce.
       if (t.ratio > cfg.releaseRatio) t.armed = true
@@ -146,7 +189,7 @@ export class GestureEngine {
         if (t.openFrames >= cfg.releaseFrames) {
           t.pinched = false
           t.closeFrames = 0
-          releases.push(t)
+          releases.push({ t, lost: false })
         }
       }
     })
@@ -155,22 +198,38 @@ export class GestureEngine {
     for (const t of [...this.tracks.values()]) {
       if (t.seenThisFrame) continue
       if (now - t.lastSeen > cfg.lostGraceMs) {
-        if (t.pinched) releases.push(t)
+        if (t.pinched) releases.push({ t, lost: true })
         this.tracks.delete(t.id)
       }
     }
 
-    for (const t of releases) this.release(t, byId)
+    for (const { t, lost } of releases) {
+      const isTap =
+        !lost && !t.gripped && now - t.pressAt <= cfg.tapMaxMs && t.travel <= cfg.tapMaxMove && now - this.lastTapAt >= cfg.tapCooldownMs
+      const { itemId, start } = t
+      this.release(t, byId)
+      if (!isTap) continue
+      // Undo the few pixels the image followed the hand during the tap.
+      if (itemId && start && !this.holdersOf(itemId).length) update(itemId, start)
+      taps.push({ point: t.aim, itemId })
+      this.lastTapAt = now
+    }
 
     for (const t of presses) {
+      t.pressAt = now
+      t.pressPos = t.pinch
+      t.travel = 0
+      t.gripped = false
+      t.start = null
       const current = items.map((it) => byId.get(it.id) ?? it)
-      const hit = topItemAt(current, t.pinch, cfg.nearMargin)
+      const hit = blocked(t.aim) || blocked(t.pinch) ? null : topItemAt(current, t.pinch, cfg.nearMargin)
       const holders = hit ? this.holdersOf(hit.id) : []
       if (!hit || holders.length >= 2) {
         t.empty = true
         continue
       }
       t.itemId = hit.id
+      t.start = { x: hit.x, y: hit.y }
       this.selectedId = hit.id
       const maxZ = Math.max(0, ...current.map((it) => it.z))
       if (hit.z < maxZ) update(hit.id, { z: maxZ + 1 })
@@ -178,6 +237,7 @@ export class GestureEngine {
         t.offset = { x: hit.x - t.pinch.x, y: hit.y - t.pinch.y }
       } else {
         const other = holders[0]
+        other.gripped = t.gripped = true
         const m = mid(other.pinch, t.pinch)
         this.grips.set(hit.id, {
           itemId: hit.id,
@@ -215,6 +275,7 @@ export class GestureEngine {
       }
     }
 
+    const next = touched.size ? items.map((it) => byId.get(it.id) ?? it) : items
     const hands: HandStatus[] = [...this.tracks.values()].map((t) => ({
       key: t.id,
       phase: this.phaseOf(t),
@@ -222,14 +283,11 @@ export class GestureEngine {
       pinched: t.pinched,
       itemId: t.itemId,
       lost: !t.seenThisFrame,
+      tip: t.tip,
+      hoverId: !t.pinched && t.seenThisFrame && !blocked(t.tip) ? (topItemAt(next, t.tip)?.id ?? null) : null,
     }))
 
-    return {
-      items: touched.size ? items.map((it) => byId.get(it.id) ?? it) : items,
-      changed: touched.size > 0,
-      hands,
-      selectedId: this.selectedId,
-    }
+    return { items: next, changed: touched.size > 0, hands, selectedId: this.selectedId, taps }
   }
 
   private holdersOf(itemId: string) {

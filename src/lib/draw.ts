@@ -53,8 +53,10 @@ export function drawOverlay(
     ctx.lineWidth = 1.5
     ctx.strokeStyle = holding ? 'rgba(140,170,255,0.95)' : 'rgba(255,255,255,0.75)'
     ctx.fillStyle = holding ? 'rgba(140,170,255,0.35)' : s.pinched ? 'rgba(255,255,255,0.25)' : 'transparent'
+    // Open hand: aim with the index fingertip. Pinched: sit between thumb and index.
+    const c = s.pinched ? s.pinch : s.tip
     ctx.beginPath()
-    ctx.arc(s.pinch.x, s.pinch.y, s.pinched ? 7 : 11, 0, Math.PI * 2)
+    ctx.arc(c.x, c.y, s.pinched ? 7 : 9, 0, Math.PI * 2)
     ctx.fill()
     ctx.stroke()
     ctx.globalAlpha = 1

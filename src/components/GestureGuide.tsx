@@ -11,6 +11,9 @@ export function GestureGuide({ onClose }: { onClose: () => void }) {
       </header>
       <ul>
         <li>
+          <b>Peek</b> Point at an image, then pinch and release quickly
+        </li>
+        <li>
           <b>Grab</b> Pinch thumb + index on an image
         </li>
         <li>
@@ -24,7 +27,7 @@ export function GestureGuide({ onClose }: { onClose: () => void }) {
         </li>
       </ul>
       <p className="guide-mouse">
-        Mouse: drag to move · scroll to resize · Shift+scroll or corner handle to rotate · Delete removes
+        Mouse: click to preview · drag to move · scroll to resize · Shift+scroll or corner handle to rotate · Delete removes
       </p>
     </aside>
   )

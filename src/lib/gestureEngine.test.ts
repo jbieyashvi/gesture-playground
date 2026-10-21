@@ -16,7 +16,7 @@ const hand = (pinch: Vec2, ratio: number, key = 'Right'): HandFrame => ({ key, p
 function run(engine: GestureEngine, items: Item[], frames: HandFrame[][], t0 = 0) {
   let cur = items
   let t = t0
-  let last = { items: cur, changed: false, hands: [], selectedId: null } as ReturnType<GestureEngine['step']>
+  let last = { items: cur, changed: false, hands: [], selectedId: null, taps: [] } as ReturnType<GestureEngine['step']>
   for (const f of frames) {
     t += 16
     last = engine.step(f, t, cur)
@@ -214,5 +214,109 @@ describe('mapToStage (mirroring + object-fit: cover)', () => {
     const edge = mapToStage(1, 0, { w: 1280, h: 720 }, { w: 1000, h: 1000 })
     expect(edge.x).toBeCloseTo(-388.9, 0)
     expect(edge.y).toBeCloseTo(0)
+  })
+})
+
+describe('GestureEngine: tap to preview', () => {
+  /** Like `run`, but collects every tap emitted along the way. */
+  function runTaps(engine: GestureEngine, items: Item[], frames: HandFrame[][], opts = {}) {
+    let cur = items
+    let t = 0
+    const taps: ReturnType<GestureEngine['step']>['taps'] = []
+    let last!: ReturnType<GestureEngine['step']>
+    for (const f of frames) {
+      t += 16
+      last = engine.step(f, t, cur, opts)
+      cur = last.items
+      taps.push(...last.taps)
+    }
+    return { items: cur, taps, last }
+  }
+  const pinchAt = (p: Vec2, n: number, key?: string) => repeat(n, () => [hand(p, PINCH, key)])
+  const quickTap = (p: Vec2) => [...open(p, 4), ...pinchAt(p, 6), ...open(p, 5)]
+  /** Taps with the point rounded away from One Euro float noise. */
+  const tidy = (taps: { point: Vec2; itemId: string | null }[]) =>
+    taps.map((t) => ({ ...t, point: { x: Math.round(t.point.x), y: Math.round(t.point.y) } }))
+
+  it('a short, still pinch-and-release taps the image once and leaves it in place', () => {
+    const p = { x: 300, y: 300 }
+    const { items, taps } = runTaps(new GestureEngine(), [item('a', 300, 300)], quickTap(p))
+    expect(tidy(taps)).toEqual([{ point: p, itemId: 'a' }])
+    expect(items[0]).toMatchObject({ x: 300, y: 300 })
+  })
+
+  it('tiny hand jitter during the tap is undone', () => {
+    const p = { x: 300, y: 300 }
+    const q = { x: 312, y: 306 }
+    const { items, taps } = runTaps(new GestureEngine(), [item('a', 300, 300)], [...open(p, 4), ...pinchAt(p, 3), ...pinchAt(q, 3), ...open(q, 5)])
+    expect(taps).toHaveLength(1)
+    expect(items[0]).toMatchObject({ x: 300, y: 300 })
+  })
+
+  it('dragging never taps', () => {
+    const a = { x: 300, y: 300 }
+    const b = { x: 420, y: 330 }
+    const { items, taps } = runTaps(new GestureEngine(), [item('a', 300, 300)], [
+      ...open(a, 4),
+      ...pinchAt(a, 3),
+      ...glide(a, b, 8).map((p) => [hand(p, PINCH)]),
+      ...open(b, 5),
+    ])
+    expect(taps).toEqual([])
+    expect(items[0].x).toBeGreaterThan(380)
+  })
+
+  it('holding a pinch too long is not a tap', () => {
+    const p = { x: 300, y: 300 }
+    const { taps } = runTaps(new GestureEngine(), [item('a', 300, 300)], [...open(p, 4), ...pinchAt(p, 40), ...open(p, 5)])
+    expect(taps).toEqual([])
+  })
+
+  it('fires once per tap, with a cooldown between taps', () => {
+    const p = { x: 300, y: 300 }
+    const fast = runTaps(new GestureEngine(), [item('a', 300, 300)], [...quickTap(p), ...quickTap(p)])
+    expect(fast.taps).toHaveLength(1)
+    const slow = runTaps(new GestureEngine(), [item('a', 300, 300)], [...quickTap(p), ...open(p, 30), ...quickTap(p)])
+    expect(slow.taps).toHaveLength(2)
+  })
+
+  it('a tap on empty space reports no image', () => {
+    const p = { x: 700, y: 600 }
+    const { taps } = runTaps(new GestureEngine(), [item('a', 300, 300)], quickTap(p))
+    expect(tidy(taps)).toEqual([{ point: p, itemId: null }])
+  })
+
+  it('blocked areas (an open preview) neither grab nor hover the image underneath', () => {
+    const p = { x: 300, y: 300 }
+    const blockers = [{ x: 250, y: 250, w: 100, h: 100 }]
+    const { items, taps, last } = runTaps(new GestureEngine(), [item('a', 300, 300)], [...quickTap(p), ...open(p, 2)], { blockers })
+    expect(tidy(taps)).toEqual([{ point: p, itemId: null }])
+    expect(items[0].z).toBe(1)
+    expect(last.hands[0].hoverId).toBeNull()
+  })
+
+  it('hovers with the index fingertip, not the pinch midpoint', () => {
+    const tip = { x: 300, y: 300 }
+    const points = repeat(21, () => ({ x: 700, y: 600 }))
+    points[8] = tip
+    const frame = (): HandFrame[] => [{ key: 'Right', pinch: { x: 700, y: 600 }, pinchRatio: OPEN, points }]
+    const { last } = runTaps(new GestureEngine(), [item('a', 300, 300)], repeat(4, frame))
+    expect(last.hands[0].hoverId).toBe('a')
+    expect(last.hands[0].tip.x).toBeCloseTo(tip.x)
+    expect(last.hands[0].tip.y).toBeCloseTo(tip.y)
+  })
+
+  it('two-hand resizing never taps, even when released quickly', () => {
+    const l = { x: 240, y: 300 }
+    const r = { x: 360, y: 300 }
+    const both = (ratio: number) => [hand(l, ratio, 'Left'), hand(r, ratio, 'Right')]
+    const { taps } = runTaps(new GestureEngine(), [item('a', 300, 300)], [...repeat(4, () => both(OPEN)), ...repeat(5, () => both(PINCH)), ...repeat(5, () => both(OPEN))])
+    expect(taps).toEqual([])
+  })
+
+  it('losing the hand mid-pinch is not a tap', () => {
+    const p = { x: 300, y: 300 }
+    const { taps } = runTaps(new GestureEngine(), [item('a', 300, 300)], [...open(p, 4), ...pinchAt(p, 4), ...repeat(30, () => [])])
+    expect(taps).toEqual([])
   })
 })
